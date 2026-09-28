@@ -87,18 +87,27 @@ func (w *OutboxPublisherWorker) runLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			w.publishBatch(ctx)
+			// Drain all batches immediately until fewer than batchSize items remain
+			for {
+				count := w.publishBatch(ctx)
+				if count < w.batchSize || ctx.Err() != nil {
+					break
+				}
+			}
 		}
 	}
 }
 
 // publishBatch locks pending events via FOR UPDATE SKIP LOCKED and dispatches them to SQS.
-func (w *OutboxPublisherWorker) publishBatch(ctx context.Context) {
+// Returns the number of events processed in this batch to support continuous draining.
+func (w *OutboxPublisherWorker) publishBatch(ctx context.Context) int {
+	var count int
 	_ = w.transactor.WithinTransaction(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		records, err := w.outboxRepo.FetchPending(ctx, tx, w.batchSize)
 		if err != nil || len(records) == 0 {
 			return err
 		}
+		count = len(records)
 
 		now := time.Now().UTC()
 		for _, rec := range records {
@@ -157,4 +166,5 @@ func (w *OutboxPublisherWorker) publishBatch(ctx context.Context) {
 
 		return nil
 	})
+	return count
 }

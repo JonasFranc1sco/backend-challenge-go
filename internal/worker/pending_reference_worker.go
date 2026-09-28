@@ -95,18 +95,27 @@ func (w *PendingReferenceWorker) runLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			w.processBatch(ctx)
+			// Drain all pending reference batches immediately
+			for {
+				count := w.processBatch(ctx)
+				if count < 25 || ctx.Err() != nil {
+					break
+				}
+			}
 		}
 	}
 }
 
 // processBatch retrieves and resolves pending references with row locks.
-func (w *PendingReferenceWorker) processBatch(ctx context.Context) {
+// Returns the number of evaluated transactions in this batch to support continuous draining.
+func (w *PendingReferenceWorker) processBatch(ctx context.Context) int {
+	var count int
 	_ = w.transactor.WithinTransaction(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		pendingTxs, err := w.txRepo.FetchPendingReferencesForRetry(ctx, tx, 25)
 		if err != nil {
 			return err
 		}
+		count = len(pendingTxs)
 
 		now := time.Now().UTC()
 		for _, pendingTx := range pendingTxs {
@@ -115,6 +124,7 @@ func (w *PendingReferenceWorker) processBatch(ctx context.Context) {
 
 		return nil
 	})
+	return count
 }
 
 func (w *PendingReferenceWorker) evaluatePendingTx(
