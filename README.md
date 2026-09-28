@@ -4,7 +4,7 @@ Serviço distribuído de alta consistência financeira e baixa latência desenvo
 
 ---
 
-## 🚀 Tecnologias e Arquitetura
+## Tecnologias e Arquitetura
 
 - **Linguagem**: Go (versão `1.27.1` declarada no `go.mod` e `Dockerfile`)
 - **Injeção de Dependências & Ciclo de Vida**: Uber Fx (`go.uber.org/fx`)
@@ -21,7 +21,7 @@ Serviço distribuído de alta consistência financeira e baixa latência desenvo
 
 ---
 
-## 📋 Pré-requisitos
+## Pré-requisitos
 
 - **Docker** (24.0+) e **Docker Compose** (v2+)
 - **Go** (1.22+ ou 1.27+) instalado localmente (ou via container Docker)
@@ -29,7 +29,7 @@ Serviço distribuído de alta consistência financeira e baixa latência desenvo
 
 ---
 
-## 🛠️ Como Iniciar o Ambiente Local
+## Como Iniciar o Ambiente Local
 
 ### 1. Iniciar os Containers (PostgreSQL, LocalStack SQS e Keycloak)
 ```bash
@@ -59,7 +59,7 @@ A API estará disponível em `http://localhost:8080`.
 
 ---
 
-## 🧪 Execução de Testes
+## Execução de Testes
 
 ### 1. Testes Unitários com Detecção de Concorrência (`-race`)
 ```bash
@@ -91,7 +91,7 @@ go test -race ./...
 
 ---
 
-## 📡 Guia de Utilização da API HTTP com cURL
+## Guia de Utilização da API HTTP com cURL
 
 ### 1. Obter Token de Autenticação OAuth 2.0 (Keycloak)
 Utilize o script utilitário `scripts/get-token.sh`:
@@ -241,5 +241,5 @@ curl -i -X POST http://localhost:8080/wallets/0192f291-27dd-7d3f-8071-5f8685deef
 
 ---
 
-## 📑 Documentação Detalhada
+## Documentação Detalhada
 Para uma explicação aprofundada de todas as garantias financeiras, mapeamento de banco de dados, locks pessimistas, máquina de estados e padrões de resiliência, consulte o documento [`ARCHITECTURE.md`](ARCHITECTURE.md).
