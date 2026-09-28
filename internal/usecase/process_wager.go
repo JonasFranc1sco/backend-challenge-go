@@ -71,8 +71,18 @@ func (uc *ProcessWagerTransactionUseCase) ExecuteWithTx(ctx context.Context, tx 
 		return nil, fmt.Errorf("failed to compute canonical hash: %w", err)
 	}
 
-	// 2. Check Idempotency by (providerId, idempotencyKey)
-	existingByKey, err := uc.txRepo.GetByProviderAndIdempotencyKey(ctx, input.ProviderID, input.IdempotencyKey)
+	// 2. Execute with Pessimistic Row Lock on the specific wallet
+	// All operations for the same wallet are strictly serialized here, preventing lost updates and race conditions.
+	wallet, err := uc.walletRepo.GetByIDForUpdate(ctx, tx, input.WalletID)
+	if err != nil {
+		if errors.Is(err, repository.ErrWalletNotFound) {
+			return nil, ErrWalletNotFound
+		}
+		return nil, fmt.Errorf("failed to lock wallet: %w", err)
+	}
+
+	// 3. Check Idempotency by (providerId, idempotencyKey) within active transaction and wallet lock
+	existingByKey, err := uc.txRepo.GetByProviderAndIdempotencyKeyTx(ctx, tx, input.ProviderID, input.IdempotencyKey)
 	if err != nil && !errors.Is(err, repository.ErrTransactionNotFound) {
 		return nil, fmt.Errorf("failed checking idempotency key: %w", err)
 	}
@@ -101,8 +111,8 @@ func (uc *ProcessWagerTransactionUseCase) ExecuteWithTx(ctx context.Context, tx 
 		return nil, ErrIdempotencyKeyConflict
 	}
 
-	// 3. Check if (providerId, externalTransactionId) exists under a different key
-	existingByExtID, err := uc.txRepo.GetByProviderAndExternalID(ctx, input.ProviderID, input.ExternalTransactionID)
+	// 4. Check if (providerId, externalTransactionId) exists under a different key within active transaction
+	existingByExtID, err := uc.txRepo.GetByProviderAndExternalIDTx(ctx, tx, input.ProviderID, input.ExternalTransactionID)
 	if err != nil && !errors.Is(err, repository.ErrTransactionNotFound) {
 		return nil, fmt.Errorf("failed checking external transaction ID: %w", err)
 	}
@@ -110,7 +120,7 @@ func (uc *ProcessWagerTransactionUseCase) ExecuteWithTx(ctx context.Context, tx 
 		return nil, ErrExternalIDAlreadyExists
 	}
 
-	// 4. Construct WagerTransaction in domain PENDING state
+	// 5. Construct WagerTransaction in domain PENDING state
 	txID := uuid.NewString()
 	wagerTx, err := domain.NewExternalTransaction(domain.ExternalTransactionParams{
 		ID:                             txID,
@@ -129,15 +139,6 @@ func (uc *ProcessWagerTransactionUseCase) ExecuteWithTx(ctx context.Context, tx 
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	// 5. Execute with Pessimistic Row Lock on the specific wallet
-	wallet, err := uc.walletRepo.GetByIDForUpdate(ctx, tx, input.WalletID)
-	if err != nil {
-		if errors.Is(err, repository.ErrWalletNotFound) {
-			return nil, ErrWalletNotFound
-		}
-		return nil, fmt.Errorf("failed to lock wallet: %w", err)
 	}
 
 	// Currency validation

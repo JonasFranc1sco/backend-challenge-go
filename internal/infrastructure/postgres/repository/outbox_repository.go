@@ -85,7 +85,23 @@ func (r *OutboxRepository) FetchPending(ctx context.Context, tx pgx.Tx, limit in
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED
 	`
-	rows, err := tx.Query(ctx, query, limit)
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	if tx != nil {
+		rows, err = tx.Query(ctx, query, limit)
+	} else {
+		nonLockingQuery := `
+			SELECT id, event_type, aggregate_type, aggregate_id, correlation_id, causation_id,
+			       payload, occurred_at, version, attempts, next_retry_at, published_at, COALESCE(last_error, '')
+			FROM outbox_events
+			WHERE published_at IS NULL AND next_retry_at <= NOW()
+			ORDER BY occurred_at ASC
+			LIMIT $1
+		`
+		rows, err = r.pool.Query(ctx, nonLockingQuery, limit)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending outbox events: %w", err)
 	}

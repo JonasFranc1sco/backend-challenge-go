@@ -28,7 +28,7 @@ services:
       AWS_DEFAULT_REGION: us-east-1
       PERSISTENCE: 0
     volumes:
-      - ./scripts/localstack-init:/etc/localstack/init/ready.d
+      - ./scripts/localstack-init:/etc/localstack/init/ready.d:z
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 5s
@@ -49,7 +49,7 @@ services:
     ports:
       - "8082:8080"
     volumes:
-      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro,z
     healthcheck:
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
       interval: 10s

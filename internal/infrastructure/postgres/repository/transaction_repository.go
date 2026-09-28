@@ -151,37 +151,53 @@ func (r *TransactionRepository) GetByID(ctx context.Context, id string) (*domain
 		SELECT id, origin, provider_id, external_transaction_id, idempotency_key, payload_hash,
 		       wallet_id, player_id, round_id, game_id, kind, amount, currency,
 		       reference_external_transaction_id, reference_internal_transaction_id,
-		       status, failure_code, balance_snapshot, created_at, updated_at
+		       status, failure_code, balance_snapshot, COALESCE(retry_count, 0), next_retry_at, created_at, updated_at
 		FROM wager_transactions
 		WHERE id = $1
 	`
 	return r.scanRow(r.pool.QueryRow(ctx, query, id))
 }
 
-// GetByProviderAndExternalID finds an external transaction by provider and external ID.
-func (r *TransactionRepository) GetByProviderAndExternalID(ctx context.Context, providerID, externalID string) (*domain.WagerTransaction, error) {
+// GetByProviderAndExternalIDTx finds an external transaction by provider and external ID, optionally within a transaction.
+func (r *TransactionRepository) GetByProviderAndExternalIDTx(ctx context.Context, tx pgx.Tx, providerID, externalID string) (*domain.WagerTransaction, error) {
 	query := `
 		SELECT id, origin, provider_id, external_transaction_id, idempotency_key, payload_hash,
 		       wallet_id, player_id, round_id, game_id, kind, amount, currency,
 		       reference_external_transaction_id, reference_internal_transaction_id,
-		       status, failure_code, balance_snapshot, created_at, updated_at
+		       status, failure_code, balance_snapshot, COALESCE(retry_count, 0), next_retry_at, created_at, updated_at
 		FROM wager_transactions
 		WHERE provider_id = $1 AND external_transaction_id = $2 AND origin = 'EXTERNAL'
 	`
+	if tx != nil {
+		return r.scanRow(tx.QueryRow(ctx, query, providerID, externalID))
+	}
 	return r.scanRow(r.pool.QueryRow(ctx, query, providerID, externalID))
 }
 
-// GetByProviderAndIdempotencyKey finds an external transaction by provider and idempotency key.
-func (r *TransactionRepository) GetByProviderAndIdempotencyKey(ctx context.Context, providerID, key string) (*domain.WagerTransaction, error) {
+// GetByProviderAndExternalID finds an external transaction by provider and external ID using the pool.
+func (r *TransactionRepository) GetByProviderAndExternalID(ctx context.Context, providerID, externalID string) (*domain.WagerTransaction, error) {
+	return r.GetByProviderAndExternalIDTx(ctx, nil, providerID, externalID)
+}
+
+// GetByProviderAndIdempotencyKeyTx finds an external transaction by provider and idempotency key, optionally within a transaction.
+func (r *TransactionRepository) GetByProviderAndIdempotencyKeyTx(ctx context.Context, tx pgx.Tx, providerID, key string) (*domain.WagerTransaction, error) {
 	query := `
 		SELECT id, origin, provider_id, external_transaction_id, idempotency_key, payload_hash,
 		       wallet_id, player_id, round_id, game_id, kind, amount, currency,
 		       reference_external_transaction_id, reference_internal_transaction_id,
-		       status, failure_code, balance_snapshot, created_at, updated_at
+		       status, failure_code, balance_snapshot, COALESCE(retry_count, 0), next_retry_at, created_at, updated_at
 		FROM wager_transactions
 		WHERE provider_id = $1 AND idempotency_key = $2 AND origin = 'EXTERNAL'
 	`
+	if tx != nil {
+		return r.scanRow(tx.QueryRow(ctx, query, providerID, key))
+	}
 	return r.scanRow(r.pool.QueryRow(ctx, query, providerID, key))
+}
+
+// GetByProviderAndIdempotencyKey finds an external transaction by provider and idempotency key using the pool.
+func (r *TransactionRepository) GetByProviderAndIdempotencyKey(ctx context.Context, providerID, key string) (*domain.WagerTransaction, error) {
+	return r.GetByProviderAndIdempotencyKeyTx(ctx, nil, providerID, key)
 }
 
 // ListPendingReferences returns pending reference transactions ordered chronologically.
@@ -190,7 +206,7 @@ func (r *TransactionRepository) ListPendingReferences(ctx context.Context, limit
 		SELECT id, origin, provider_id, external_transaction_id, idempotency_key, payload_hash,
 		       wallet_id, player_id, round_id, game_id, kind, amount, currency,
 		       reference_external_transaction_id, reference_internal_transaction_id,
-		       status, failure_code, balance_snapshot, created_at, updated_at
+		       status, failure_code, balance_snapshot, COALESCE(retry_count, 0), next_retry_at, created_at, updated_at
 		FROM wager_transactions
 		WHERE status = 'PENDING_REFERENCE'
 		ORDER BY created_at ASC
@@ -222,7 +238,7 @@ func (r *TransactionRepository) FetchPendingReferencesForRetry(ctx context.Conte
 		SELECT id, origin, provider_id, external_transaction_id, idempotency_key, payload_hash,
 		       wallet_id, player_id, round_id, game_id, kind, amount, currency,
 		       reference_external_transaction_id, reference_internal_transaction_id,
-		       status, failure_code, balance_snapshot, created_at, updated_at
+		       status, failure_code, balance_snapshot, COALESCE(retry_count, 0), next_retry_at, created_at, updated_at
 		FROM wager_transactions
 		WHERE status = 'PENDING_REFERENCE' AND next_retry_at <= NOW()
 		ORDER BY next_retry_at ASC, created_at ASC
@@ -262,7 +278,6 @@ func (r *TransactionRepository) ScheduleReferenceRetry(ctx context.Context, tx p
 	return nil
 }
 
-
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -274,6 +289,8 @@ func (r *TransactionRepository) scanRow(row rowScanner) (*domain.WagerTransactio
 		providerID, extID, key, hash, roundID, gameID, refExtID, refIntID, failCode sql.NullString
 		balSnapshot                             sql.NullInt64
 		walletID, playerID                      string
+		retryCount                              int
+		nextRetryAt                             sql.NullTime
 		createdAt, updatedAt                    time.Time
 	)
 
@@ -281,7 +298,7 @@ func (r *TransactionRepository) scanRow(row rowScanner) (*domain.WagerTransactio
 		&id, &origin, &providerID, &extID, &key, &hash,
 		&walletID, &playerID, &roundID, &gameID, &kindStr, &amountUnits, &currency,
 		&refExtID, &refIntID,
-		&statusStr, &failCode, &balSnapshot, &createdAt, &updatedAt,
+		&statusStr, &failCode, &balSnapshot, &retryCount, &nextRetryAt, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -304,7 +321,7 @@ func (r *TransactionRepository) scanRow(row rowScanner) (*domain.WagerTransactio
 		snapshot = &snapMoney
 	}
 
-	return domain.RehydrateTransaction(
+	txObj, err := domain.RehydrateTransaction(
 		id,
 		domain.TransactionOrigin(origin),
 		providerID.String,
@@ -325,4 +342,15 @@ func (r *TransactionRepository) scanRow(row rowScanner) (*domain.WagerTransactio
 		createdAt,
 		updatedAt,
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	var nextTime time.Time
+	if nextRetryAt.Valid {
+		nextTime = nextRetryAt.Time
+	}
+	txObj.WithRetries(retryCount, nextTime)
+
+	return txObj, nil
 }

@@ -10,7 +10,7 @@ ENDPOINT="http://localhost:4566"
 echo "Creating wager-transactions-dlq.fifo..."
 awslocal sqs create-queue \
   --queue-name wager-transactions-dlq.fifo \
-  --attributes FifoQueue=true,ContentBasedDeduplication=false,MessageRetentionPeriod=1209600 \
+  --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"false","MessageRetentionPeriod":"1209600"}' \
   --region "${AWS_REGION}"
 
 # Get DLQ ARN
@@ -24,19 +24,17 @@ DLQ_ARN=$(awslocal sqs get-queue-attributes \
 echo "DLQ ARN: ${DLQ_ARN}"
 
 # Create Main FIFO Queue with RedrivePolicy (maxReceiveCount: 5)
-REDRIVE_POLICY="{\"deadLetterTargetArn\":\"${DLQ_ARN}\",\"maxReceiveCount\":\"5\"}"
-
 echo "Creating wager-transactions.fifo with redrive policy..."
 awslocal sqs create-queue \
   --queue-name wager-transactions.fifo \
-  --attributes FifoQueue=true,ContentBasedDeduplication=false,VisibilityTimeout=30,RedrivePolicy="${REDRIVE_POLICY}" \
+  --attributes "{\"FifoQueue\":\"true\",\"ContentBasedDeduplication\":\"false\",\"VisibilityTimeout\":\"30\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"5\\\"}\"}" \
   --region "${AWS_REGION}"
 
 # Create Outbox Events FIFO Queue
 echo "Creating wager-events.fifo..."
 awslocal sqs create-queue \
   --queue-name wager-events.fifo \
-  --attributes FifoQueue=true,ContentBasedDeduplication=false,VisibilityTimeout=30 \
+  --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"false","VisibilityTimeout":"30"}' \
   --region "${AWS_REGION}"
 
 echo "LocalStack SQS FIFO queues successfully initialized!"

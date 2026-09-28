@@ -232,6 +232,13 @@ func RehydrateTransaction(
 	}, nil
 }
 
+// WithRetries sets persisted retry metadata during rehydration.
+func (t *WagerTransaction) WithRetries(count int, nextRetry time.Time) *WagerTransaction {
+	t.retryCount = count
+	t.nextRetryAt = nextRetry.UTC()
+	return t
+}
+
 // State Machine Transitions
 
 // MarkProcessed transitions the transaction to PROCESSED (terminal).
