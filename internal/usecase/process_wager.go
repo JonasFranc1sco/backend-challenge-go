@@ -37,9 +37,22 @@ func NewProcessWagerTransactionUseCase(
 	}
 }
 
-// Execute processes a wager transaction with canonical idempotency, per-wallet pessimistic locking,
-// append-only ledger entries, and transactional outbox event emission.
+// Execute processes a wager transaction within its own ACID transaction.
 func (uc *ProcessWagerTransactionUseCase) Execute(ctx context.Context, input ProcessWagerInput) (*ProcessWagerOutput, error) {
+	var output *ProcessWagerOutput
+	err := uc.transactor.WithinTransaction(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		output, err = uc.ExecuteWithTx(ctx, tx, input)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+// ExecuteWithTx executes the wager transaction within an existing SQL transaction (e.g. sharing with Inbox).
+func (uc *ProcessWagerTransactionUseCase) ExecuteWithTx(ctx context.Context, tx pgx.Tx, input ProcessWagerInput) (*ProcessWagerOutput, error) {
 	now := time.Now().UTC()
 
 	// 1. Calculate deterministic Canonical Payload Hash
@@ -118,69 +131,47 @@ func (uc *ProcessWagerTransactionUseCase) Execute(ctx context.Context, input Pro
 		return nil, err
 	}
 
-	// 5. Execute Domain Processing inside ACID Transaction with Pessimistic Row Lock
-	var output *ProcessWagerOutput
-
-	err = uc.transactor.WithinTransaction(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		// Pessimistic Row Lock on the specific wallet
-		wallet, err := uc.walletRepo.GetByIDForUpdate(ctx, tx, input.WalletID)
-		if err != nil {
-			if errors.Is(err, repository.ErrWalletNotFound) {
-				return ErrWalletNotFound
-			}
-			return fmt.Errorf("failed to lock wallet: %w", err)
-		}
-
-		// Currency validation
-		if wallet.Currency() != input.Money.Currency() {
-			wagerTx.MarkRejected(domain.FailureCodeInvalidCurrency, now)
-			if err := uc.txRepo.Create(ctx, tx, wagerTx); err != nil {
-				return err
-			}
-			if err := uc.emitRejectedEvent(ctx, tx, wagerTx, input.CorrelationID, now); err != nil {
-				return err
-			}
-			output = &ProcessWagerOutput{
-				TransactionID:    txID,
-				Status:           domain.StatusRejected,
-				Balance:          wallet.Balance(),
-				IdempotentReplay: false,
-				FailureCode:      domain.FailureCodeInvalidCurrency,
-			}
-			return nil
-		}
-
-		switch input.Kind {
-		case domain.KindBet:
-			output, err = uc.processBet(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
-			return err
-
-		case domain.KindWin:
-			output, err = uc.processWin(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
-			return err
-
-		case domain.KindLoss:
-			output, err = uc.processLoss(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
-			return err
-
-		case domain.KindRefund:
-			output, err = uc.processRefund(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
-			return err
-
-		case domain.KindRollback:
-			output, err = uc.processRollback(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
-			return err
-
-		default:
-			return fmt.Errorf("%w: %s", domain.ErrInvalidTransactionKind, input.Kind)
-		}
-	})
-
+	// 5. Execute with Pessimistic Row Lock on the specific wallet
+	wallet, err := uc.walletRepo.GetByIDForUpdate(ctx, tx, input.WalletID)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, repository.ErrWalletNotFound) {
+			return nil, ErrWalletNotFound
+		}
+		return nil, fmt.Errorf("failed to lock wallet: %w", err)
 	}
 
-	return output, nil
+	// Currency validation
+	if wallet.Currency() != input.Money.Currency() {
+		_ = wagerTx.MarkRejected(domain.FailureCodeInvalidCurrency, now)
+		if err := uc.txRepo.Create(ctx, tx, wagerTx); err != nil {
+			return nil, err
+		}
+		if err := uc.emitRejectedEvent(ctx, tx, wagerTx, input.CorrelationID, now); err != nil {
+			return nil, err
+		}
+		return &ProcessWagerOutput{
+			TransactionID:    txID,
+			Status:           domain.StatusRejected,
+			Balance:          wallet.Balance(),
+			IdempotentReplay: false,
+			FailureCode:      domain.FailureCodeInvalidCurrency,
+		}, nil
+	}
+
+	switch input.Kind {
+	case domain.KindBet:
+		return uc.processBet(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
+	case domain.KindWin:
+		return uc.processWin(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
+	case domain.KindLoss:
+		return uc.processLoss(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
+	case domain.KindRefund:
+		return uc.processRefund(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
+	case domain.KindRollback:
+		return uc.processRollback(ctx, tx, wallet, wagerTx, input.CorrelationID, now)
+	default:
+		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidTransactionKind, input.Kind)
+	}
 }
 
 func (uc *ProcessWagerTransactionUseCase) processBet(
