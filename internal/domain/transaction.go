@@ -75,6 +75,8 @@ type WagerTransaction struct {
 	status                          TransactionStatus
 	failureCode                     string
 	balanceSnapshot                 *Money
+	retryCount                      int
+	nextRetryAt                     time.Time
 	createdAt                       time.Time
 	updatedAt                       time.Time
 }
@@ -302,5 +304,15 @@ func (t *WagerTransaction) ReferenceInternalTransactionID() string { return t.re
 func (t *WagerTransaction) Status() TransactionStatus              { return t.status }
 func (t *WagerTransaction) FailureCode() string                    { return t.failureCode }
 func (t *WagerTransaction) BalanceSnapshot() *Money                { return t.balanceSnapshot }
+func (t *WagerTransaction) RetryCount() int                        { return t.retryCount }
+func (t *WagerTransaction) NextRetryAt() time.Time                 { return t.nextRetryAt }
 func (t *WagerTransaction) CreatedAt() time.Time                   { return t.createdAt }
 func (t *WagerTransaction) UpdatedAt() time.Time                   { return t.updatedAt }
+
+// IncrementRetry records a retry attempt with next backoff time.
+func (t *WagerTransaction) IncrementRetry(nextRetry time.Time, now time.Time) {
+	t.retryCount++
+	t.nextRetryAt = nextRetry.UTC()
+	t.updatedAt = now.UTC()
+}
+

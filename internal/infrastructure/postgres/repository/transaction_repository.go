@@ -213,6 +213,56 @@ func (r *TransactionRepository) ListPendingReferences(ctx context.Context, limit
 	return result, rows.Err()
 }
 
+// FetchPendingReferencesForRetry locks and returns pending references ready for retry using FOR UPDATE SKIP LOCKED.
+func (r *TransactionRepository) FetchPendingReferencesForRetry(ctx context.Context, tx pgx.Tx, limit int) ([]*domain.WagerTransaction, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT id, origin, provider_id, external_transaction_id, idempotency_key, payload_hash,
+		       wallet_id, player_id, round_id, game_id, kind, amount, currency,
+		       reference_external_transaction_id, reference_internal_transaction_id,
+		       status, failure_code, balance_snapshot, created_at, updated_at
+		FROM wager_transactions
+		WHERE status = 'PENDING_REFERENCE' AND next_retry_at <= NOW()
+		ORDER BY next_retry_at ASC, created_at ASC
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED
+	`
+	rows, err := tx.Query(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch pending references: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*domain.WagerTransaction
+	for rows.Next() {
+		txItem, err := r.scanRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, txItem)
+	}
+	return result, rows.Err()
+}
+
+// ScheduleReferenceRetry records an attempt and schedules the next exponential backoff retry.
+func (r *TransactionRepository) ScheduleReferenceRetry(ctx context.Context, tx pgx.Tx, txID string, nextRetryAt time.Time) error {
+	query := `
+		UPDATE wager_transactions
+		SET retry_count = retry_count + 1,
+		    next_retry_at = $1,
+		    updated_at = NOW()
+		WHERE id = $2
+	`
+	_, err := tx.Exec(ctx, query, nextRetryAt.UTC(), txID)
+	if err != nil {
+		return fmt.Errorf("failed to schedule reference retry: %w", err)
+	}
+	return nil
+}
+
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
