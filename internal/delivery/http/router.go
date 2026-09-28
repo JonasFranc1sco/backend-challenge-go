@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/auth"
+	"github.com/JonasFranc1sco/backend-challenge-go/internal/observability"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // RouterConfig holds handler and middleware dependencies for constructing the HTTP mux.
@@ -12,15 +14,22 @@ type RouterConfig struct {
 	TransactionHandler *TransactionHandler
 	HealthHandler      *HealthHandler
 	JWTValidator       auth.JWTValidator
+	Metrics            *observability.Metrics
 }
 
 // NewRouter constructs the HTTP ServeMux with authentication, role enforcement, and tenancy protection.
 func NewRouter(cfg RouterConfig) http.Handler {
 	mux := http.NewServeMux()
 
-	// 1. Public Health Endpoints
+	// 1. Public Health & Metrics Endpoints
 	mux.HandleFunc("GET /health/live", cfg.HealthHandler.Live)
 	mux.HandleFunc("GET /health/ready", cfg.HealthHandler.Ready)
+
+	if cfg.Metrics != nil && cfg.Metrics.Registry != nil {
+		mux.Handle("GET /metrics", promhttp.HandlerFor(cfg.Metrics.Registry, promhttp.HandlerOpts{}))
+	} else {
+		mux.Handle("GET /metrics", promhttp.Handler())
+	}
 
 	// Auth middlewares
 	authenticate := auth.Authenticate(cfg.JWTValidator)

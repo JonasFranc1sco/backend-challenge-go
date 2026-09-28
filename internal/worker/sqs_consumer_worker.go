@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -14,22 +15,23 @@ import (
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/domain"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/postgres"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/postgres/repository"
+	"github.com/JonasFranc1sco/backend-challenge-go/internal/observability"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/usecase"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 	awstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
-// SQSMessageEnvelope represents the expected SQS message contract.
 type SQSMessageEnvelope struct {
 	MessageID  string         `json:"messageId"`
 	Type       string         `json:"type"`
 	OccurredAt string         `json:"occurredAt"`
-	Data       SQSMessageData `json:"data"`
+	Data       SQSWagerData   `json:"data"`
 }
 
-type SQSMessageData struct {
+type SQSWagerData struct {
 	ProviderID                     string       `json:"providerId"`
 	ExternalTransactionID          string       `json:"externalTransactionId"`
 	IdempotencyKey                 string       `json:"idempotencyKey"`
@@ -57,6 +59,8 @@ type SQSConsumerWorker struct {
 	consumerName   string
 	maxMessages    int32
 	waitTime       int32
+	logger         *slog.Logger
+	metrics        *observability.Metrics
 	stopChan       chan struct{}
 	wg             sync.WaitGroup
 }
@@ -70,6 +74,8 @@ func NewSQSConsumerWorker(
 	consumerName string,
 	maxMessages int32,
 	waitTime int32,
+	logger *slog.Logger,
+	metrics *observability.Metrics,
 ) *SQSConsumerWorker {
 	if consumerName == "" {
 		consumerName = "wager-transactions-consumer"
@@ -89,6 +95,8 @@ func NewSQSConsumerWorker(
 		consumerName:   consumerName,
 		maxMessages:    maxMessages,
 		waitTime:       waitTime,
+		logger:         logger,
+		metrics:        metrics,
 		stopChan:       make(chan struct{}),
 	}
 }
@@ -141,7 +149,9 @@ func (w *SQSConsumerWorker) pollAndProcess(ctx context.Context) {
 
 	result, err := w.sqsClient.ReceiveMessage(ctx, input)
 	if err != nil {
-		// Log or brief backoff on connection error
+		if w.logger != nil {
+			w.logger.Warn("error polling SQS queue", slog.String("error", err.Error()))
+		}
 		select {
 		case <-time.After(1 * time.Second):
 		case <-ctx.Done():
@@ -173,10 +183,16 @@ func (w *SQSConsumerWorker) processSingleMessage(ctx context.Context, msg awstyp
 	var envelope SQSMessageEnvelope
 	if err := json.Unmarshal([]byte(bodyStr), &envelope); err != nil {
 		// Poison message: permanently unprocessable syntax error
+		if w.metrics != nil && w.metrics.DLQMessagesTotal != nil {
+			w.metrics.DLQMessagesTotal.WithLabelValues("unparseable_json").Inc()
+		}
+		if w.logger != nil {
+			w.logger.Error("poison message unprocessable JSON", slog.String("messageId", *msg.MessageId))
+		}
 		return
 	}
 
-	if envelope.MessageID == "" {
+	if envelope.MessageID == "" && msg.MessageId != nil {
 		envelope.MessageID = *msg.MessageId
 	}
 
@@ -189,6 +205,9 @@ func (w *SQSConsumerWorker) processSingleMessage(ctx context.Context, msg awstyp
 
 		if alreadyExists && status == "PROCESSED" {
 			// Already successfully treated in previous commit (at-least-once redelivery). Safe to delete from SQS.
+			if w.metrics != nil && w.metrics.IdempotentReplaysTotal != nil {
+				w.metrics.IdempotentReplaysTotal.WithLabelValues(envelope.Data.ProviderID).Inc()
+			}
 			return nil
 		}
 
@@ -198,19 +217,24 @@ func (w *SQSConsumerWorker) processSingleMessage(ctx context.Context, msg awstyp
 		if kind == domain.KindLoss {
 			money, err = domain.NewNonNegativeMoneyFromDecimal(envelope.Data.Money.Amount, envelope.Data.Money.Currency)
 			if err != nil || !money.IsZero() {
-				// Invalid loss amount -> rejection
+				// Invalid loss amount -> default to 0.00
 				money, _ = domain.MoneyZero(envelope.Data.Money.Currency)
 			}
 		} else {
 			money, err = domain.NewPositiveMoneyFromDecimal(envelope.Data.Money.Amount, envelope.Data.Money.Currency)
 			if err != nil {
-				// Reject immediately
-				return nil
+				// Reject immediately and mark completed in inbox
+				return w.inboxRepo.MarkCompleted(ctx, tx, w.consumerName, envelope.MessageID)
 			}
 		}
 
+		if w.metrics != nil && w.metrics.TransactionDuration != nil {
+			timer := prometheus.NewTimer(w.metrics.TransactionDuration.WithLabelValues(string(kind)))
+			defer timer.ObserveDuration()
+		}
+
 		// Execute Wager Transaction sharing the active SQL transaction
-		_, execErr := w.processWagerUC.ExecuteWithTx(ctx, tx, usecase.ProcessWagerInput{
+		out, execErr := w.processWagerUC.ExecuteWithTx(ctx, tx, usecase.ProcessWagerInput{
 			ProviderID:                     envelope.Data.ProviderID,
 			ExternalTransactionID:          envelope.Data.ExternalTransactionID,
 			IdempotencyKey:                 envelope.Data.IdempotencyKey,
@@ -226,13 +250,46 @@ func (w *SQSConsumerWorker) processSingleMessage(ctx context.Context, msg awstyp
 
 		if execErr != nil {
 			// If it's a conflict or wallet not found (non-transient), we still mark inbox completed
-			if errors.Is(execErr, usecase.ErrIdempotencyKeyConflict) ||
-				errors.Is(execErr, usecase.ErrExternalIDAlreadyExists) ||
-				errors.Is(execErr, usecase.ErrWalletNotFound) {
+			if errors.Is(execErr, usecase.ErrIdempotencyKeyConflict) {
+				if w.metrics != nil && w.metrics.IdempotencyConflictsTotal != nil {
+					w.metrics.IdempotencyConflictsTotal.WithLabelValues("payload_mismatch").Inc()
+				}
+				return w.inboxRepo.MarkCompleted(ctx, tx, w.consumerName, envelope.MessageID)
+			}
+			if errors.Is(execErr, usecase.ErrExternalIDAlreadyExists) {
+				if w.metrics != nil && w.metrics.IdempotencyConflictsTotal != nil {
+					w.metrics.IdempotencyConflictsTotal.WithLabelValues("external_id_conflict").Inc()
+				}
+				return w.inboxRepo.MarkCompleted(ctx, tx, w.consumerName, envelope.MessageID)
+			}
+			if errors.Is(execErr, usecase.ErrWalletNotFound) {
 				return w.inboxRepo.MarkCompleted(ctx, tx, w.consumerName, envelope.MessageID)
 			}
 			// Transient infrastructure error: rollback so SQS redrives message
+			if w.metrics != nil && w.metrics.RetriesTotal != nil {
+				w.metrics.RetriesTotal.WithLabelValues("sqs_consumer").Inc()
+			}
 			return execErr
+		}
+
+		if w.metrics != nil {
+			if w.metrics.WagerTransactionsTotal != nil {
+				w.metrics.WagerTransactionsTotal.WithLabelValues(string(kind), string(out.Status), envelope.Data.ProviderID).Inc()
+			}
+			if out.IdempotentReplay && w.metrics.IdempotentReplaysTotal != nil {
+				w.metrics.IdempotentReplaysTotal.WithLabelValues(envelope.Data.ProviderID).Inc()
+			}
+		}
+
+		if w.logger != nil {
+			w.logger.Info("sqs wager transaction processed",
+				slog.String("messageId", envelope.MessageID),
+				slog.String("transactionId", out.TransactionID),
+				slog.String("walletId", envelope.Data.WalletID),
+				slog.String("providerId", envelope.Data.ProviderID),
+				slog.String("status", string(out.Status)),
+				slog.Bool("idempotentReplay", out.IdempotentReplay),
+			)
 		}
 
 		// Mark inbox message completed

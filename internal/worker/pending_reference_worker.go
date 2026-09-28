@@ -3,13 +3,14 @@ package worker
 import (
 	"context"
 	"errors"
-	"math"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/domain"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/postgres"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/postgres/repository"
+	"github.com/JonasFranc1sco/backend-challenge-go/internal/observability"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -22,6 +23,8 @@ type PendingReferenceWorker struct {
 	outboxRepo   *repository.OutboxRepository
 	pollInterval time.Duration
 	maxRetries   int
+	logger       *slog.Logger
+	metrics      *observability.Metrics
 	stopChan     chan struct{}
 	wg           sync.WaitGroup
 }
@@ -34,6 +37,8 @@ func NewPendingReferenceWorker(
 	outboxRepo *repository.OutboxRepository,
 	pollInterval time.Duration,
 	maxRetries int,
+	logger *slog.Logger,
+	metrics *observability.Metrics,
 ) *PendingReferenceWorker {
 	if pollInterval <= 0 {
 		pollInterval = 1 * time.Second
@@ -49,6 +54,8 @@ func NewPendingReferenceWorker(
 		outboxRepo:   outboxRepo,
 		pollInterval: pollInterval,
 		maxRetries:   maxRetries,
+		logger:       logger,
+		metrics:      metrics,
 		stopChan:     make(chan struct{}),
 	}
 }
@@ -113,11 +120,26 @@ func (w *PendingReferenceWorker) processBatch(ctx context.Context) {
 func (w *PendingReferenceWorker) evaluatePendingTx(
 	ctx context.Context, tx pgx.Tx, pendingTx *domain.WagerTransaction, now time.Time,
 ) {
+	correlationID := uuid.NewString()
+
 	// 1. Check if max retry attempts or TTL expired
 	if pendingTx.RetryCount() >= w.maxRetries {
 		_ = pendingTx.MarkRejected(domain.FailureCodeReferenceNotFound, now)
 		_ = w.txRepo.Update(ctx, tx, pendingTx)
-		_ = w.emitRejectedEvent(ctx, tx, pendingTx, uuid.NewString(), now)
+		_ = w.emitRejectedEvent(ctx, tx, pendingTx, correlationID, now)
+
+		if w.metrics != nil && w.metrics.WagerTransactionsTotal != nil {
+			w.metrics.WagerTransactionsTotal.WithLabelValues(string(pendingTx.Kind()), string(domain.StatusRejected), pendingTx.ProviderID()).Inc()
+		}
+		if w.logger != nil {
+			w.logger.Warn("pending reference retries exhausted, transaction rejected",
+				slog.String("correlationId", correlationID),
+				slog.String("transactionId", pendingTx.ID()),
+				slog.String("providerId", pendingTx.ProviderID()),
+				slog.String("walletId", pendingTx.WalletID()),
+				slog.String("failureCode", domain.FailureCodeReferenceNotFound),
+			)
+		}
 		return
 	}
 
@@ -129,11 +151,19 @@ func (w *PendingReferenceWorker) evaluatePendingTx(
 
 	// Reference still not arrived
 	if refTx == nil {
-		backoffSeconds := math.Pow(2, float64(pendingTx.RetryCount()))
-		if backoffSeconds > 30 {
-			backoffSeconds = 30
+		if w.metrics != nil && w.metrics.RetriesTotal != nil {
+			w.metrics.RetriesTotal.WithLabelValues("pending_reference").Inc()
 		}
-		nextRetry := now.Add(time.Duration(backoffSeconds) * time.Second)
+
+		shift := pendingTx.RetryCount()
+		if shift > 5 {
+			shift = 5
+		}
+		backoffSec := 1 << shift
+		if backoffSec > 30 {
+			backoffSec = 30
+		}
+		nextRetry := now.Add(time.Duration(backoffSec) * time.Second)
 		_ = w.txRepo.ScheduleReferenceRetry(ctx, tx, pendingTx.ID(), nextRetry)
 		return
 	}
@@ -149,7 +179,19 @@ func (w *PendingReferenceWorker) evaluatePendingTx(
 	if refTx.Status() == domain.StatusRejected || refTx.Status() == domain.StatusFailed {
 		_ = pendingTx.MarkRejected(domain.FailureCodeReferenceFailed, now)
 		_ = w.txRepo.Update(ctx, tx, pendingTx)
-		_ = w.emitRejectedEvent(ctx, tx, pendingTx, uuid.NewString(), now)
+		_ = w.emitRejectedEvent(ctx, tx, pendingTx, correlationID, now)
+
+		if w.metrics != nil && w.metrics.WagerTransactionsTotal != nil {
+			w.metrics.WagerTransactionsTotal.WithLabelValues(string(pendingTx.Kind()), string(domain.StatusRejected), pendingTx.ProviderID()).Inc()
+		}
+		if w.logger != nil {
+			w.logger.Warn("referenced transaction ended in failure, pending transaction rejected",
+				slog.String("correlationId", correlationID),
+				slog.String("transactionId", pendingTx.ID()),
+				slog.String("referenceExternalId", pendingTx.ReferenceExternalTransactionID()),
+				slog.String("failureCode", domain.FailureCodeReferenceFailed),
+			)
+		}
 		return
 	}
 
@@ -164,7 +206,11 @@ func (w *PendingReferenceWorker) evaluatePendingTx(
 		refTx.RoundID() != pendingTx.RoundID() || !refTx.Money().Equals(pendingTx.Money()) {
 		_ = pendingTx.MarkRejected(domain.FailureCodeReferenceMismatch, now)
 		_ = w.txRepo.Update(ctx, tx, pendingTx)
-		_ = w.emitRejectedEvent(ctx, tx, pendingTx, uuid.NewString(), now)
+		_ = w.emitRejectedEvent(ctx, tx, pendingTx, correlationID, now)
+
+		if w.metrics != nil && w.metrics.WagerTransactionsTotal != nil {
+			w.metrics.WagerTransactionsTotal.WithLabelValues(string(pendingTx.Kind()), string(domain.StatusRejected), pendingTx.ProviderID()).Inc()
+		}
 		return
 	}
 
@@ -181,7 +227,7 @@ func (w *PendingReferenceWorker) evaluatePendingTx(
 		if refTx.Kind() != domain.KindBet {
 			_ = pendingTx.MarkRejected(domain.FailureCodeReferenceMismatch, now)
 			_ = w.txRepo.Update(ctx, tx, pendingTx)
-			_ = w.emitRejectedEvent(ctx, tx, pendingTx, uuid.NewString(), now)
+			_ = w.emitRejectedEvent(ctx, tx, pendingTx, correlationID, now)
 			return
 		}
 		ledgerDir = domain.DirectionCredit
@@ -201,7 +247,7 @@ func (w *PendingReferenceWorker) evaluatePendingTx(
 				if errors.Is(err, domain.ErrInsufficientBalance) {
 					_ = pendingTx.MarkRejected(domain.FailureCodeReversalInsufficientFunds, now)
 					_ = w.txRepo.Update(ctx, tx, pendingTx)
-					_ = w.emitRejectedEvent(ctx, tx, pendingTx, uuid.NewString(), now)
+					_ = w.emitRejectedEvent(ctx, tx, pendingTx, correlationID, now)
 					return
 				}
 				return
@@ -211,7 +257,7 @@ func (w *PendingReferenceWorker) evaluatePendingTx(
 		default:
 			_ = pendingTx.MarkRejected(domain.FailureCodeReferenceMismatch, now)
 			_ = w.txRepo.Update(ctx, tx, pendingTx)
-			_ = w.emitRejectedEvent(ctx, tx, pendingTx, uuid.NewString(), now)
+			_ = w.emitRejectedEvent(ctx, tx, pendingTx, correlationID, now)
 			return
 		}
 	default:
@@ -232,8 +278,22 @@ func (w *PendingReferenceWorker) evaluatePendingTx(
 	_ = w.ledgerRepo.Create(ctx, tx, ledgerEntry)
 
 	// Emit events
-	_ = w.emitProcessedEvent(ctx, tx, pendingTx, balAfter, uuid.NewString(), now)
-	_ = w.emitBalanceChangedEvent(ctx, tx, wallet.ID(), pendingTx.ID(), string(ledgerDir), pendingTx.Money(), balBefore, balAfter, wallet.Version(), uuid.NewString(), now)
+	_ = w.emitProcessedEvent(ctx, tx, pendingTx, balAfter, correlationID, now)
+	_ = w.emitBalanceChangedEvent(ctx, tx, wallet.ID(), pendingTx.ID(), string(ledgerDir), pendingTx.Money(), balBefore, balAfter, wallet.Version(), correlationID, now)
+
+	if w.metrics != nil && w.metrics.WagerTransactionsTotal != nil {
+		w.metrics.WagerTransactionsTotal.WithLabelValues(string(pendingTx.Kind()), string(domain.StatusProcessed), pendingTx.ProviderID()).Inc()
+	}
+
+	if w.logger != nil {
+		w.logger.Info("pending reference resolved and transaction processed",
+			slog.String("correlationId", correlationID),
+			slog.String("transactionId", pendingTx.ID()),
+			slog.String("providerId", pendingTx.ProviderID()),
+			slog.String("walletId", pendingTx.WalletID()),
+			slog.String("status", string(domain.StatusProcessed)),
+		)
+	}
 }
 
 func (w *PendingReferenceWorker) emitProcessedEvent(

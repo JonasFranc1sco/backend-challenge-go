@@ -3,6 +3,7 @@ package http
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/domain"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/postgres/repository"
+	"github.com/JonasFranc1sco/backend-challenge-go/internal/observability"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/usecase"
 )
 
@@ -18,6 +20,8 @@ type WalletHandler struct {
 	reconciliationUC *usecase.ReconciliationUseCase
 	walletRepo       *repository.WalletRepository
 	ledgerRepo       *repository.LedgerRepository
+	logger           *slog.Logger
+	metrics          *observability.Metrics
 }
 
 func NewWalletHandler(
@@ -25,12 +29,16 @@ func NewWalletHandler(
 	reconciliationUC *usecase.ReconciliationUseCase,
 	walletRepo *repository.WalletRepository,
 	ledgerRepo *repository.LedgerRepository,
+	logger *slog.Logger,
+	metrics *observability.Metrics,
 ) *WalletHandler {
 	return &WalletHandler{
 		openWalletUC:     openWalletUC,
 		reconciliationUC: reconciliationUC,
 		walletRepo:       walletRepo,
 		ledgerRepo:       ledgerRepo,
+		logger:           logger,
+		metrics:          metrics,
 	}
 }
 
@@ -65,6 +73,14 @@ func (h *WalletHandler) OpenWallet(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
+	}
+
+	if h.logger != nil {
+		h.logger.Info("wallet opened successfully",
+			slog.String("walletId", out.ID),
+			slog.String("playerId", out.PlayerID),
+			slog.Int64("version", out.Version),
+		)
 	}
 
 	writeJSON(w, http.StatusCreated, WalletResponse{
@@ -159,6 +175,27 @@ func (h *WalletHandler) Reconcile(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
+	}
+
+	// Audit consistency: report discrepancies in response, structured logs, and Prometheus metric
+	if !out.Consistent {
+		if h.metrics != nil {
+			h.metrics.ReconciliationDiscrepanciesTotal.Inc()
+		}
+		if h.logger != nil {
+			h.logger.Error("reconciliation discrepancy detected",
+				slog.String("walletId", walletID),
+				slog.String("storedBalance", out.StoredBalance.String()),
+				slog.String("calculatedBalance", out.CalculatedBalance.String()),
+				slog.String("difference", out.Difference.String()),
+				slog.Int("checkedEntries", out.CheckedEntries),
+			)
+		}
+	} else if h.logger != nil {
+		h.logger.Info("reconciliation verified consistent",
+			slog.String("walletId", walletID),
+			slog.Int("checkedEntries", out.CheckedEntries),
+		)
 	}
 
 	writeJSON(w, http.StatusOK, out)

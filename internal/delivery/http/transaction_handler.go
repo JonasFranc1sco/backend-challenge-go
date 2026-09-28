@@ -3,28 +3,37 @@ package http
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/domain"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/auth"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/postgres/repository"
+	"github.com/JonasFranc1sco/backend-challenge-go/internal/observability"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/usecase"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type TransactionHandler struct {
 	processWagerUC *usecase.ProcessWagerTransactionUseCase
 	txRepo         *repository.TransactionRepository
+	logger         *slog.Logger
+	metrics        *observability.Metrics
 }
 
 func NewTransactionHandler(
 	processWagerUC *usecase.ProcessWagerTransactionUseCase,
 	txRepo *repository.TransactionRepository,
+	logger *slog.Logger,
+	metrics *observability.Metrics,
 ) *TransactionHandler {
 	return &TransactionHandler{
 		processWagerUC: processWagerUC,
 		txRepo:         txRepo,
+		logger:         logger,
+		metrics:        metrics,
 	}
 }
 
@@ -60,6 +69,11 @@ func (h *TransactionHandler) ProcessTransaction(w http.ResponseWriter, r *http.R
 	if kind == domain.KindOpening {
 		writeError(w, http.StatusBadRequest, "invalid_kind", "OPENING transactions cannot be submitted externally")
 		return
+	}
+
+	if h.metrics != nil && h.metrics.TransactionDuration != nil {
+		timer := prometheus.NewTimer(h.metrics.TransactionDuration.WithLabelValues(string(kind)))
+		defer timer.ObserveDuration()
 	}
 
 	// Parse Money depending on kind
@@ -103,10 +117,16 @@ func (h *TransactionHandler) ProcessTransaction(w http.ResponseWriter, r *http.R
 
 	if err != nil {
 		if errors.Is(err, usecase.ErrIdempotencyKeyConflict) {
+			if h.metrics != nil && h.metrics.IdempotencyConflictsTotal != nil {
+				h.metrics.IdempotencyConflictsTotal.WithLabelValues("payload_mismatch").Inc()
+			}
 			writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency key reused with different payload")
 			return
 		}
 		if errors.Is(err, usecase.ErrExternalIDAlreadyExists) {
+			if h.metrics != nil && h.metrics.IdempotencyConflictsTotal != nil {
+				h.metrics.IdempotencyConflictsTotal.WithLabelValues("external_id_conflict").Inc()
+			}
 			writeError(w, http.StatusConflict, "external_id_conflict", "External transaction ID already registered under a different idempotency key")
 			return
 		}
@@ -116,6 +136,26 @@ func (h *TransactionHandler) ProcessTransaction(w http.ResponseWriter, r *http.R
 		}
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
+	}
+
+	if h.metrics != nil {
+		if h.metrics.WagerTransactionsTotal != nil {
+			h.metrics.WagerTransactionsTotal.WithLabelValues(string(kind), string(out.Status), strings.TrimSpace(req.ProviderID)).Inc()
+		}
+		if out.IdempotentReplay && h.metrics.IdempotentReplaysTotal != nil {
+			h.metrics.IdempotentReplaysTotal.WithLabelValues(strings.TrimSpace(req.ProviderID)).Inc()
+		}
+	}
+
+	if h.logger != nil {
+		h.logger.Info("wager transaction processed",
+			slog.String("correlationId", correlationID),
+			slog.String("transactionId", out.TransactionID),
+			slog.String("walletId", strings.TrimSpace(req.WalletID)),
+			slog.String("providerId", strings.TrimSpace(req.ProviderID)),
+			slog.String("status", string(out.Status)),
+			slog.Bool("idempotentReplay", out.IdempotentReplay),
+		)
 	}
 
 	resp := TransactionResponse{

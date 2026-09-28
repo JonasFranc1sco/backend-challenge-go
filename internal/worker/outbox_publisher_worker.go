@@ -2,13 +2,14 @@ package worker
 
 import (
 	"context"
-	"math"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/postgres"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/postgres/repository"
 	"github.com/JonasFranc1sco/backend-challenge-go/internal/infrastructure/sqs"
+	"github.com/JonasFranc1sco/backend-challenge-go/internal/observability"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -18,6 +19,8 @@ type OutboxPublisherWorker struct {
 	publisher    sqs.EventPublisher
 	pollInterval time.Duration
 	batchSize    int
+	logger       *slog.Logger
+	metrics      *observability.Metrics
 	stopChan     chan struct{}
 	wg           sync.WaitGroup
 }
@@ -28,6 +31,8 @@ func NewOutboxPublisherWorker(
 	publisher sqs.EventPublisher,
 	pollInterval time.Duration,
 	batchSize int,
+	logger *slog.Logger,
+	metrics *observability.Metrics,
 ) *OutboxPublisherWorker {
 	if pollInterval <= 0 {
 		pollInterval = 500 * time.Millisecond
@@ -41,6 +46,8 @@ func NewOutboxPublisherWorker(
 		publisher:    publisher,
 		pollInterval: pollInterval,
 		batchSize:    batchSize,
+		logger:       logger,
+		metrics:      metrics,
 		stopChan:     make(chan struct{}),
 	}
 }
@@ -100,18 +107,52 @@ func (w *OutboxPublisherWorker) publishBatch(ctx context.Context) {
 			// MessageDeduplicationId = EventID (ensures idempotency on broker)
 			pubErr := w.publisher.Publish(ctx, rec.ID, rec.AggregateID, rec.Payload)
 			if pubErr != nil {
-				// Exponential backoff retry
-				backoff := math.Pow(2, float64(rec.Attempts))
-				if backoff > 60 {
-					backoff = 60
+				if w.metrics != nil && w.metrics.RetriesTotal != nil {
+					w.metrics.RetriesTotal.WithLabelValues("outbox_publisher").Inc()
 				}
-				nextRetry := now.Add(time.Duration(backoff) * time.Second)
+				if w.logger != nil {
+					w.logger.Warn("failed to publish outbox event, scheduling retry",
+						slog.String("eventId", rec.ID),
+						slog.String("aggregateId", rec.AggregateID),
+						slog.Int("attempt", rec.Attempts),
+						slog.String("error", pubErr.Error()),
+					)
+				}
+
+				// Exponential backoff retry using integer bit shift (1, 2, 4, 8, 16, 32, 60s)
+				shift := rec.Attempts
+				if shift > 6 {
+					shift = 6
+				}
+				backoffSec := 1 << shift
+				if backoffSec > 60 {
+					backoffSec = 60
+				}
+				nextRetry := now.Add(time.Duration(backoffSec) * time.Second)
 				_ = w.outboxRepo.ScheduleRetry(ctx, tx, rec.ID, pubErr.Error(), nextRetry)
 				continue
 			}
 
 			// Mark successfully published
 			_ = w.outboxRepo.MarkPublished(ctx, tx, rec.ID)
+
+			if w.metrics != nil {
+				if w.metrics.OutboxPublishedTotal != nil {
+					w.metrics.OutboxPublishedTotal.Inc()
+				}
+				if w.metrics.OutboxLagSeconds != nil {
+					lag := time.Since(rec.OccurredAt).Seconds()
+					w.metrics.OutboxLagSeconds.Set(lag)
+				}
+			}
+
+			if w.logger != nil {
+				w.logger.Debug("outbox event published successfully",
+					slog.String("eventId", rec.ID),
+					slog.String("aggregateId", rec.AggregateID),
+					slog.String("eventType", rec.EventType),
+				)
+			}
 		}
 
 		return nil
